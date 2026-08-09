@@ -1,0 +1,10 @@
+- [Huys-Video-Editor cross-platform notes](huys-video-editor-cross-platform.md) — Mac/Windows OS-profile architecture + known gotchas (ffmpeg, HEVC bug, Whisper lang detection)
+- [Huys-Video-Editor backups](huys-video-editor-backups.md) — proactively back up changed files to `~/Documents/Huys-Video-Editor - back up/DD-MM-YY/` after big changes
+- [Huys-Video-Editor roadmap](huys-video-editor-roadmap.md) — full 6-step pipeline vision (editor → media search → shorts generator → social manager → bibliography → integration)
+- [Obsidian vault for Social Media Project](obsidian-vault-social-media-project.md) — SleepyVault location + where each pipeline step's spec/diary notes live
+- [Obsidian diary permissions](obsidian-diary-permissions.md) — hard write boundary (step-2 progress file only, append-only) + diary writing style
+- [Obsidian vault last-check timestamp](obsidian-vault-last-check.md) — tracks the 12h re-scan habit, update after every check
+- [Media search Mode A spec](media-search-mode-a-spec.md) — confirmed scale/video-handling/cloud-scope/interface decisions for the direct-search engine
+- [Response timestamps](response-timestamps.md) — prefix responses with a real timestamp (via `date`), standing request since 2026-08-03
+- [Media search shared-drive architecture](media-search-shared-drive-architecture.md) — portable paths + exFAT/SQLite locking fix so the index works from both Mac and PC
+- [Media search Windows first full index run](media-search-windows-first-full-index.md) — 5 real bugs found/fixed (cloud-placeholder hang, no hwaccel, CUDA OOM cascade, etc.), frame interval 5s→1s

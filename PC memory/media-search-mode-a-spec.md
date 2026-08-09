@@ -1,0 +1,25 @@
+---
+name: media-search-mode-a-spec
+description: Confirmed technical scope/decisions for Mode A (direct search) of the step-2 media search engine
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 2df0ce9d-ffca-42b6-803c-7e48c9199b4d
+  modified: 2026-08-07T03:14:37.060Z
+---
+
+Confirmed 2026-08-02, building on [[huys-video-editor-roadmap]] step 2 and the Mode A/Mode B split recorded in the vault's `Media storage search system.md`:
+
+- **Scale**: library is low thousands of items, up to ~10k, majority video, total up to ~1TB. This rules out needing a real vector DB (Chroma/LanceDB) for v1 — a plain numpy array of embeddings + a lightweight sqlite (or even flat JSON) metadata table is entirely sufficient at this scale (cosine similarity over tens of thousands of vectors is near-instant), and keeps the dependency footprint small, consistent with this project's existing stdlib-first testing philosophy ([[huys-video-editor-cross-platform]]).
+- **Video handling**: video IS a first-class input — confirmed with the user that under the hood, videos get sampled into representative frames (CLIP only understands still images), each frame embedded individually, and a video "hit" surfaces if any of its frames score well against a query. Frame-sampling density (e.g. one frame every N seconds) is a tunable parameter to calibrate later against real accuracy testing — the user has explicitly signed off on needing to iterate this once built, not expecting it right on the first try.
+- **v1 scope — local/downloaded files only, designed to pick up cloud items automatically later.** The user wants cloud-photo support kept possible for the future. Realistic path: don't build special cloud-download logic now — index whatever's currently local, track what's indexed by file identity so a future re-index run just picks up anything newly downloaded since. This avoids the actual hard problem (Apple provides no API for programmatic on-demand iCloud downloads — already confirmed in step 1's own diary, 21-07-2026 entry: "Apple simply not allowing access to cloud files... either download full library or when needed for editing").
+- **Correction delivered to the user 2026-08-02**: they believed on-demand cloud download works on Windows only. Checked directly against `main.py` — it's the reverse, and even that is partial: the Mac (`native_db`/osxphotos) pipeline's `resolve_local_path` re-checks Photos and auto-copies a file into the Import folder ONLY if it's already been downloaded by Photos.app itself; if not, it shows the user manual export instructions rather than triggering any real download. The Windows (`cloud`) pipeline just does a flat folder scan (`folder.glob`) assuming iCloud-for-Windows has already synced files there — it has no per-item cloud-resolution logic at all. Neither platform does a true "click it and it downloads from iCloud" — that capability doesn't exist via any API on either OS.
+- **v1 interface**: plain CLI script is fine for now — but the user explicitly wants the engine kept ready for a future `main.py` integration (a new tab or similar), reinforcing the already-agreed engine-first design (plain functions, no GUI coupling, so a UI layer can be added later without restructuring).
+
+**Temporary test data, added 2026-08-02 — REMOVE when step 2 testing is done:** `media_index.py` has a `TEMP_TEST_FOLDERS` constant (currently `~/Documents/Photos back up`, 4,502 files/~22GB, mostly video) added purely for playtesting with a bigger, more representative sample than what's natively downloaded via Photos (372 files). It's fenced with clearly-marked "TEMPORARY TEST DATA" comments in both `list_library_media()`'s definition and its usage. This is explicitly the user's own instruction to delete later, not a permanent feature — flag it for removal once Mode A's accuracy/design is considered settled, don't let it quietly become permanent scope.
+
+**How to apply:** when building the indexing/query scripts, honor the numpy+sqlite (not Chroma/LanceDB) call, keep video-frame-sampling density as an exposed/tunable parameter rather than hardcoded, and don't build iCloud-download-triggering logic — just make the indexer incremental/re-runnable so newly-downloaded cloud items get swept up automatically on a later run.
+
+**Frame-sampling density calibrated, 06-08-2026:** changed from 5s to 1s per user request (`FRAME_INTERVAL_SECONDS` in `media_index.py`). Recalibrating this is now a solved, repeatable problem, not a one-off - a `frame_interval_seconds` column + `force_reembed_stale_videos()` function correctly find and only-re-embed videos still at a stale density (see [[media-search-windows-first-full-index]] for the full mechanism and the CUDA-OOM bug that surfaced from this same change - long videos at 1s density can need capped-batch embedding).
+
+**`TEMP_TEST_FOLDERS` note above is now fully superseded**, not just removed - see [[media-search-shared-drive-architecture]] for the permanent shared-drive source that replaced it.
