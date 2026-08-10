@@ -1,3 +1,6 @@
 step1_transcript.md
-Ignore
 ffmpeg
+.DS_Store
+.vscode/
+__pycache__/
+PC memory/
