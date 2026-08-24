@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from config import to_portable_path
 from media_index import EXTERNAL_DRIVE_LABEL, init_db, unload_clip_model
-from media_search import GALLERY_STYLE, build_gallery_cards, get_thumbnail_dir, search
+from media_search import GALLERY_STYLE, build_gallery_cards, get_thumbnail_dir, smart_search
 
 PORT = 8765
 
@@ -62,12 +62,31 @@ SEARCH_FORM = """
     <option value="video" {sel_video}>Video only</option>
     <option value="image" {sel_image}>Image only</option>
   </select>
+  <select name="person" title="Filter by labeled person">
+    {person_options}
+  </select>
   <input type="number" name="top" value="{top}" min="1" max="200" title="How many results">
   <input type="date" name="after" value="{after}" title="Only after this date">
   <input type="date" name="before" value="{before}" title="Only before this date">
   <button type="submit">Search</button>
 </form>
 """
+
+
+def _person_options_html(selected):
+    """<option> tags for the Person filter, "All people" first, populated
+    from face_index's labeled people - local import, same reasoning as
+    media_search.search()'s own person filter (keeps face_index's cv2/hdbscan
+    out of a request that doesn't use this filter's underlying data, even
+    though this particular server already pays torch's import cost at
+    startup unconditionally, unlike main.py's lazier Search tab)."""
+    import face_index
+    parts = [f'<option value="" {"selected" if not selected else ""}>All people</option>']
+    for p in face_index.list_people():
+        name = p["name"]
+        sel = "selected" if name == selected else ""
+        parts.append(f'<option value="{html.escape(name)}" {sel}>{html.escape(name)}</option>')
+    return "".join(parts)
 
 
 def _is_indexed_file(real_file_path):
@@ -104,6 +123,7 @@ class SearchHandler(BaseHTTPRequestHandler):
         after = params.get("after", [""])[0] or None
         before = params.get("before", [""])[0] or None
         file_type = params.get("type", [""])[0] or None
+        person = params.get("person", [""])[0] or None
 
         form = SEARCH_FORM.format(
             query=html.escape(query), top=html.escape(top),
@@ -111,10 +131,11 @@ class SearchHandler(BaseHTTPRequestHandler):
             sel_all="selected" if not file_type else "",
             sel_video="selected" if file_type == "video" else "",
             sel_image="selected" if file_type == "image" else "",
+            person_options=_person_options_html(person),
         )
 
         if parsed.path == "/search" and query:
-            results = search(query, top_k=int(top), after=after, before=before, file_types=file_type)
+            results = smart_search(query, top_k=int(top), after=after, before=before, file_types=file_type, explicit_person=person)
             _schedule_clip_unload()
             status_line = f"<p>{len(results)} results for &quot;{html.escape(query)}&quot;</p>" if results else \
                 "<p>No results - try a different query, or check the index has been built.</p>"

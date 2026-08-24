@@ -18,12 +18,12 @@ from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout,
                              QVBoxLayout, QGridLayout, QPushButton, QListWidget, QListWidgetItem, QLabel,
                              QFileDialog, QMessageBox, QDoubleSpinBox, QSpinBox, QComboBox, QTextEdit, QCheckBox,
-                             QTabWidget, QScrollArea, QDateEdit, QLineEdit)
-from PyQt6.QtCore import QDate, QThread, QTimer, QUrl, Qt, pyqtSignal
-from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QDesktopServices, QPixmap
+                             QTabWidget, QScrollArea, QDateEdit, QLineEdit, QCompleter)
+from PyQt6.QtCore import QDate, QThread, QTimer, QUrl, Qt, pyqtSignal, QStringListModel
+from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QDesktopServices, QPixmap, QImage
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
-from config import EXTERNAL_DRIVE_LABEL, VIDEO_EXTENSIONS, find_volume_by_label, get_os_profile, walk_media_files
+from config import EXTERNAL_DRIVE_LABEL, VIDEO_EXTENSIONS, find_volume_by_label, get_os_profile, resolve_portable_path, walk_media_files
 
 # One consistent folder for videos exported out of Photos for editing - easy to find, easy to clean up
 IMPORT_CACHE_DIR = Path.home() / "Documents" / "HuysVideoEditor_Imports"
@@ -50,6 +50,15 @@ CLIP_IDLE_UNLOAD_MS = 10 * 60 * 1000
 RESULT_THUMB_WIDTH = 160
 RESULT_THUMB_HEIGHT = 110
 RESULT_CARD_WIDTH = 180
+
+# People tab - a real freeze otherwise, not just a slow-feeling one: loading every crop
+# image for a large group (measured live, 2026-08-20: the real library's "Unclustered"
+# bucket alone, 6,440 faces) synchronously on the UI thread took 88.67s for the image
+# loads alone, before any widget construction - the same "fine at test scale, breaks at
+# real scale" category of bug as the reclustering fix. Search results never hit this
+# since the user picks a result count (search_top_box, capped at 200); nothing capped
+# how many faces a single cluster/person/match-review could try to render at once.
+MAX_FACES_TO_DISPLAY = 200
 
 # All 100 languages faster-whisper/Whisper supports, code -> display name
 WHISPER_LANGUAGE_NAMES = {
@@ -261,13 +270,14 @@ class SearchWorker(QThread):
     results_ready = pyqtSignal(list)
     search_failed = pyqtSignal(str)
 
-    def __init__(self, query, top_k, after, before, file_types):
+    def __init__(self, query, top_k, after, before, file_types, person=None):
         super().__init__()
         self.query = query
         self.top_k = top_k
         self.after = after
         self.before = before
         self.file_types = file_types
+        self.person = person
 
     def run(self):
         try:
@@ -279,9 +289,9 @@ class SearchWorker(QThread):
             )
             return
         try:
-            results = media_search.search(
+            results = media_search.smart_search(
                 self.query, top_k=self.top_k, after=self.after,
-                before=self.before, file_types=self.file_types,
+                before=self.before, file_types=self.file_types, explicit_person=self.person,
             )
             # Thumbnail + duration are both generated here, not on the UI
             # thread - by the time results_ready fires, every thumbnail is
@@ -297,6 +307,24 @@ class SearchWorker(QThread):
             self.results_ready.emit(results)
         except Exception as e:
             self.search_failed.emit(str(e))
+
+
+class ReclusterWorker(QThread):
+    """Runs face_index.recluster_faces() off the UI thread. Measured live
+    against the real library (2026-08-20): ~2 minutes over ~14,500 faces -
+    trivial against the handful of faces this was first tested with, but a
+    real freeze at real scale if left on the UI thread, the same reasoning
+    as SearchWorker above."""
+    finished_ok = pyqtSignal(int)
+    recluster_failed = pyqtSignal(str)
+
+    def run(self):
+        try:
+            import face_index
+            count = face_index.recluster_faces()
+            self.finished_ok.emit(count)
+        except Exception as e:
+            self.recluster_failed.emit(str(e))
 
 
 class DefaultingDateEdit(QDateEdit):
@@ -445,13 +473,36 @@ class ProfessionalAIEditor(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_editor_tab(), "🎬 Editor")
         self.tabs.addTab(self._build_search_tab(), "🔍 Prompt-Style Search")
+        self.tabs.addTab(self._build_people_tab(), "👤 People")
         self.setCentralWidget(self.tabs)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        self.load_iphone_photos()
+
+    def _on_tab_changed(self, index):
         # Pausing both unconditionally on every switch is simpler than tracking
         # which tab was just left, and harmless - pausing a player that isn't
         # currently playing is a no-op.
-        self.tabs.currentChanged.connect(lambda _: (self.player.pause(), self.search_preview_player.pause()))
+        self.player.pause()
+        self.search_preview_player.pause()
+        if self.tabs.tabText(index) == "🔍 Prompt-Style Search":
+            self._refresh_search_person_filter()
 
-        self.load_iphone_photos()
+    def _refresh_search_person_filter(self):
+        """Keeps the Search tab's Person dropdown in sync with face_index's
+        labeled people - called lazily on switching to this tab, not at app
+        startup, same lazy-import discipline as everywhere else face_index
+        is touched (it pulls in cv2/hdbscan, real deps most searches don't
+        need). Preserves the current selection across a refresh if that name
+        is still labeled, rather than always resetting to "All people"."""
+        import face_index
+        current = self.search_person_box.currentText()
+        self.search_person_box.clear()
+        self.search_person_box.addItem("All people")
+        self.search_person_box.addItems([p["name"] for p in face_index.list_people()])
+        idx = self.search_person_box.findText(current)
+        if idx >= 0:
+            self.search_person_box.setCurrentIndex(idx)
 
     def _build_editor_tab(self):
         central_widget = QWidget()
@@ -606,6 +657,14 @@ class ProfessionalAIEditor(QMainWindow):
         self.search_type_box.addItems(["All types", "Video only", "Image only"])
         filter_row.addWidget(self.search_type_box)
 
+        # Starts with just "All people" - populated for real by
+        # _refresh_search_person_filter(), called lazily whenever this tab
+        # becomes active (see the tabs.currentChanged wiring), not at startup -
+        # same lazy-import discipline as everywhere else face_index is touched.
+        self.search_person_box = QComboBox()
+        self.search_person_box.addItem("All people")
+        filter_row.addWidget(self.search_person_box)
+
         self.search_top_box = QSpinBox()
         self.search_top_box.setRange(1, 200)
         self.search_top_box.setValue(20)
@@ -717,11 +776,13 @@ class ProfessionalAIEditor(QMainWindow):
             self.search_type_box.currentText()]
         after = self.search_after_box.date().toString("yyyy-MM-dd") if self.search_after_box.is_active() else None
         before = self.search_before_box.date().toString("yyyy-MM-dd") if self.search_before_box.is_active() else None
+        person = self.search_person_box.currentText()
+        person = None if person == "All people" else person
 
         self.btn_search.setEnabled(False)
         self.search_status_label.setText(f'🔍 Searching for "{query}"...')
 
-        self.search_worker = SearchWorker(query, self.search_top_box.value(), after, before, file_types)
+        self.search_worker = SearchWorker(query, self.search_top_box.value(), after, before, file_types, person)
         self.search_worker.results_ready.connect(self._on_search_results)
         self.search_worker.search_failed.connect(self._on_search_failed)
         self.search_worker.start()
@@ -740,7 +801,12 @@ class ProfessionalAIEditor(QMainWindow):
             self.search_status_label.setText("No results - try a different query, or check the index has been built.")
             return
 
-        self.search_status_label.setText(f"{len(results)} results")
+        # Surfaces smart_search()'s natural-language people-detection (2026-08-24) -
+        # this parsing happens silently otherwise, so confirm what was actually
+        # understood from the query text rather than leaving it a black box.
+        matched_people = results[0].get("matched_people")
+        people_note = f" - matched: {', '.join(matched_people)}" if matched_people else ""
+        self.search_status_label.setText(f"{len(results)} results{people_note}")
         for result in results:
             self.search_result_cards.append(self._build_result_card(result))
         self._relayout_result_grid()
@@ -782,6 +848,15 @@ class ProfessionalAIEditor(QMainWindow):
         info_label.setStyleSheet("color: #aaa; font-size: 11px;")
         info_label.setWordWrap(True)
         card_layout.addWidget(info_label)
+
+        # Only present on smart_search() results (2026-08-24) that detected at
+        # least one person in the query text/dropdown - makes the "prioritize
+        # by mentioned people" ranking visible instead of a silent black box.
+        if result.get("matched_people"):
+            people_label = QLabel(f"👤 {', '.join(result['matched_people'])} ({result['match_count']} matched)")
+            people_label.setStyleSheet("color: #9cf; font-size: 10px;")
+            people_label.setWordWrap(True)
+            card_layout.addWidget(people_label)
 
         path_label = QLabel(Path(result["file_path"]).name)
         path_label.setStyleSheet("color: #777; font-size: 10px;")
@@ -835,7 +910,14 @@ class ProfessionalAIEditor(QMainWindow):
     def _confirm_selection(self):
         if not self.selected_search_results:
             return
-        ranked = sorted(self.selected_search_results.values(), key=lambda r: r["score"], reverse=True)
+        # score can be None - smart_search() (2026-08-24) skips CLIP scoring
+        # entirely when a query was just a person's name with nothing left to
+        # rank by. Scored results still sort first; None-scored ones group
+        # together after them rather than crashing the comparison.
+        ranked = sorted(
+            self.selected_search_results.values(),
+            key=lambda r: (r["score"] is not None, r["score"] or 0), reverse=True,
+        )
 
         for i, result in enumerate(ranked):
             path = result["file_path"]
@@ -875,6 +957,627 @@ class ProfessionalAIEditor(QMainWindow):
         self.tabs.setCurrentIndex(0)
         self.status_label.setText(
             f"Showing {len(ranked)} confirmed item(s) - hit '🔄 Refresh Media List' to reveal the rest again.")
+
+    def _build_people_tab(self):
+        """Browse face-recognition clusters produced by face_index.py and
+        name them. Deliberately no QThread here (unlike the Search tab's
+        SearchWorker) - browsing/labeling is small sqlite + JPEG reads, no
+        model inference, so it stays synchronous on the UI thread the same
+        way the Search tab already builds its result cards. face_index is
+        imported locally in each handler (not at module level) so opening
+        this tab, or even launching the app, never pulls in numpy/hdbscan
+        unless the tab is actually used - and even then, insightface itself
+        (the heavy part) is never touched here at all, only by the separate
+        build_face_index() indexing pass."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        top_row = QHBoxLayout()
+        self.people_status_label = QLabel("Loading...")
+        self.people_status_label.setStyleSheet("color: #aaa; font-style: italic;")
+        top_row.addWidget(self.people_status_label, 1)
+        self.btn_refresh_recluster = self.add_button(top_row, "🔄 Refresh && Recluster", self._refresh_people_tab)
+        self.btn_find_matches = self.add_button(top_row, "🔍 Find Matches", self._find_people_matches)
+        layout.addLayout(top_row)
+
+        body_layout = QHBoxLayout()
+
+        left_panel = QVBoxLayout()
+        self.people_groups_header_label = QLabel("Pending clusters + named people")
+        left_panel.addWidget(self.people_groups_header_label)
+        self.people_groups_list = QListWidget()
+        self.people_groups_list.itemClicked.connect(self._on_people_group_selected)
+        left_panel.addWidget(self.people_groups_list)
+        # No stretch - width is capped to its longest current line (see
+        # _fit_people_groups_list_width(), called after every reload) rather than
+        # sharing leftover horizontal space, so it stops crowding the name box and
+        # preview pane out (2026-08-21 request).
+        body_layout.addLayout(left_panel, 0)
+
+        center_panel = QVBoxLayout()
+        self.people_faces_container = QWidget()
+        self.people_faces_grid = QGridLayout(self.people_faces_container)
+        self.people_faces_grid.setSpacing(8)
+        self.people_scroll_area = ResultsScrollArea()
+        self.people_scroll_area.setWidgetResizable(True)
+        self.people_scroll_area.setWidget(self.people_faces_container)
+        self._people_grid_relayout_timer = QTimer(self)
+        self._people_grid_relayout_timer.setSingleShot(True)
+        self._people_grid_relayout_timer.timeout.connect(self._relayout_people_grid)
+        self.people_scroll_area.resized.connect(lambda: self._people_grid_relayout_timer.start(100))
+        center_panel.addWidget(self.people_scroll_area, 1)
+
+        body_layout.addLayout(center_panel, 2)
+
+        preview_panel = QVBoxLayout()
+        preview_panel.addWidget(QLabel("Preview (source photo)"))
+        self.people_preview_image = QLabel()
+        self.people_preview_image.setStyleSheet("background-color: black;")
+        self.people_preview_image.setAlignment(Qt.AlignmentFlag.AlignCenter)  # the scaled
+        # pixmap rarely exactly fills the label (aspect ratio varies per photo) -
+        # without this it sits top-left instead of centered in the empty space
+        preview_panel.addWidget(self.people_preview_image, 1)
+        # Bumped from 1 to 2 (now equal to center_panel) now that the pending-list
+        # column no longer competes for stretch space - the width it used to take
+        # goes to this pane instead (2026-08-21 request).
+        body_layout.addLayout(preview_panel, 2)
+
+        layout.addLayout(body_layout, 1)
+
+        # Full tab width, not nested inside center_panel - it used to share center_panel's
+        # (roughly half the window) width with 4 buttons, squashing the QLineEdit down to
+        # almost nothing since buttons don't shrink below their text but the name box does
+        # (2026-08-21 request). Living below body_layout instead doesn't change what it acts
+        # on - that's still whatever's selected in the left panel / rendered in the grid above.
+        label_row = QHBoxLayout()
+        self.people_name_box = QLineEdit()
+        self.people_name_box.setPlaceholderText("Name this person...")
+        self.people_name_box.returnPressed.connect(self._on_people_name_box_enter)
+        # Populated/refreshed in _load_people_lists() with current labeled-person
+        # names, so it narrows as you type instead of requiring the full name.
+        self.people_name_completer = QCompleter([], self)
+        self.people_name_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.people_name_box.setCompleter(self.people_name_completer)
+        label_row.addWidget(self.people_name_box, 1)
+        self.btn_confirm_label = self.add_button(label_row, "✅ Confirm", self._confirm_people_label, primary=True)
+        discard_rename_col = QVBoxLayout()  # stacked, not another column in the row - user's explicit layout ask
+        self.btn_discard_cluster = self.add_button(discard_rename_col, "🗑️ Discard cluster", self._discard_people_cluster)
+        self.btn_rename_person = self.add_button(discard_rename_col, "✏️ Rename", self._rename_people_person)
+        self.btn_remove_from_person = self.add_button(discard_rename_col, "🚫 Remove from Person", self._remove_from_person)
+        label_row.addLayout(discard_rename_col)
+        self.btn_apply_matches = self.add_button(label_row, "✅ Apply Selected Matches", self._apply_people_matches, primary=True)
+        self.btn_undo = self.add_button(label_row, "↩️ Undo", self._undo_last_people_action)
+        # Shown/hidden per selection type (2026-08-24 request), not just greyed out -
+        # Confirm/Discard only make sense for a pending cluster, Rename/Remove only for
+        # an already-labeled person, Apply Selected Matches only in Find-Matches mode.
+        # Nothing is selected yet at startup, so all four start hidden; Undo is the one
+        # exception - it's not tied to a selection type, just enabled/disabled normally.
+        for btn in (self.btn_confirm_label, self.btn_discard_cluster, self.btn_rename_person,
+                    self.btn_remove_from_person, self.btn_apply_matches):
+            btn.setVisible(False)
+        self.btn_undo.setEnabled(False)
+        layout.addLayout(label_row)
+
+        self.people_current_group = None  # {"type": "cluster"/"person"/"matches", ...}
+        self.people_excluded_faces = set()  # face_vector_index values un-checked in the currently-open cluster
+        self.people_current_matches_plan = []  # last propose_matches() result - a plan, nothing written yet
+        self.people_accepted_matches = set()  # face_vector_index values checked "yes, this is who it says" in match review
+        self.people_face_cards = []
+        self.people_displayed_faces = []  # face dicts actually rendered right now - what Confirm/Discard may act on
+        self.people_recluster_worker = None
+        self.people_last_action = None  # {"description": ..., "faces": {fvi: {"person_id", "cluster_id", "discarded"}}}
+                                         # - single-level undo only; a new action overwrites this, it doesn't stack
+
+        self._load_people_lists()
+        return tab
+
+    def _refresh_people_tab(self):
+        """Triggered by the "Refresh & Recluster" button - runs the real
+        HDBSCAN reclustering pass in the background (ReclusterWorker), NOT
+        on every tab open/label action. Measured live: ~2 minutes over the
+        real ~14,500-face library - freezing the whole app for that on every
+        launch, or after every single label, was a real bug, not a style
+        choice (see the 2026-08-20 diary/memory note). Labeling/discarding/
+        applying matches only need _load_people_lists() - a fast DB read -
+        since they don't change what a cluster of *already-clustered* faces
+        looks like, only which faces are still pending."""
+        if self.people_recluster_worker is not None and self.people_recluster_worker.isRunning():
+            return
+        # Disabled for the duration - a second connection to the same sqlite db while
+        # this one holds it (EXCLUSIVE locking mode) would fail, not just double-run.
+        self.btn_refresh_recluster.setEnabled(False)
+        self.btn_find_matches.setEnabled(False)
+        # Hidden rather than just disabled, matching the selection-based show/hide
+        # pattern - nothing stays selected once _load_people_lists() reloads after
+        # this finishes, so there's nothing to correctly re-show them for anyway.
+        for btn in (self.btn_confirm_label, self.btn_discard_cluster, self.btn_rename_person,
+                    self.btn_remove_from_person, self.btn_apply_matches):
+            btn.setVisible(False)
+        self.people_groups_list.setEnabled(False)
+        self.people_status_label.setText("Reclustering... can take a couple of minutes over a real library.")
+
+        self.people_recluster_worker = ReclusterWorker()
+        self.people_recluster_worker.finished_ok.connect(self._on_recluster_finished)
+        self.people_recluster_worker.recluster_failed.connect(self._on_recluster_failed)
+        self.people_recluster_worker.start()
+
+    def _on_recluster_finished(self, cluster_count):
+        self.btn_refresh_recluster.setEnabled(True)
+        self.btn_find_matches.setEnabled(True)
+        self.people_groups_list.setEnabled(True)
+        self._load_people_lists()
+
+    def _on_recluster_failed(self, message):
+        self.btn_refresh_recluster.setEnabled(True)
+        self.btn_find_matches.setEnabled(True)
+        self.people_groups_list.setEnabled(True)
+        self.people_status_label.setText(f"Reclustering failed: {message}")
+
+    def _load_people_lists(self):
+        """Fast, DB-only reload of both lists - does NOT recompute
+        clustering (see _refresh_people_tab for the slow, explicit-only
+        path). Used at startup and after every labeling action. Safe to
+        call with zero faces indexed yet (a fresh install, or before
+        build_face_index.py has ever been run) - everything below degrades
+        to empty lists rather than erroring."""
+        import face_index
+        self.people_groups_list.clear()
+        clusters = face_index.list_unlabeled_clusters()
+        people = face_index.list_people()
+
+        for cluster, suffix in self._ordered_pending_clusters(clusters):
+            label = "Unclustered" if cluster["cluster_id"] == -1 else f"C {cluster['cluster_id']}"
+            item = QListWidgetItem(f"{label} ({cluster['count']}){suffix}")
+            item.setData(Qt.ItemDataRole.UserRole, {"type": "cluster", "cluster_id": cluster["cluster_id"]})
+            self.people_groups_list.addItem(item)
+
+        for p in people:
+            item = QListWidgetItem(f"👤 {p['name']} ({p['face_count']})")
+            item.setData(Qt.ItemDataRole.UserRole, {"type": "person", "person_id": p["person_id"], "name": p["name"]})
+            self.people_groups_list.addItem(item)
+
+        self._fit_people_groups_list_width()
+        # Re-set (not mutated in place) so the completer's popup reflects renames/merges/new
+        # people immediately - stale autocomplete suggestions would be actively misleading.
+        self.people_name_completer.setModel(QStringListModel([p["name"] for p in people], self))
+
+    def _fit_people_groups_list_width(self):
+        """Caps the pending/people list to its longest current line instead of
+        sharing stretch space with the rest of the tab - user's explicit ask
+        (2026-08-21), since a wide list (hundreds of clusters, one with a long
+        suggested name) was squeezing the name box and preview pane. Recomputed
+        every reload since the real text (cluster ids, suggested names) changes."""
+        metrics = self.people_groups_list.fontMetrics()
+        widths = [metrics.horizontalAdvance(self.people_groups_list.item(i).text())
+                  for i in range(self.people_groups_list.count())]
+        widths.append(metrics.horizontalAdvance(self.people_groups_header_label.text()))
+        longest = max(widths, default=0)
+        # Padding for the list's own frame margins, item icon indent, and a
+        # vertical scrollbar - measured to comfortably fit them, not exact.
+        self.people_groups_list.setMaximumWidth(longest + 48)
+
+    def _ordered_pending_clusters(self, clusters):
+        """Reorders the pending-clusters list so likely-related ones sit
+        next to each other, instead of scattered purely by size - directly
+        answers "many small clusters are the same person" (2026-08-20/21
+        diary notes) by surfacing that adjacency instead of leaving it to be
+        found by luck while scrolling. Three tiers, each falling through to
+        the next: (1) clusters matching an already-labeled person, grouped
+        by that person's name; (2) clusters matching each other (neither
+        matches a labeled person yet) via suggest_cluster_groupings(),
+        placed adjacent in pairs; (3) everything else, original size order.
+        "Unclustered" (-1) is excluded from all of this - a large mixed bag
+        with no single identity to compare - and always appended last.
+        Returns (cluster_dict, label_suffix) tuples."""
+        import face_index
+        real_clusters = [c for c in clusters if c["cluster_id"] != -1]
+        unclustered = [c for c in clusters if c["cluster_id"] == -1]
+        by_id = {c["cluster_id"]: c for c in real_clusters}
+
+        person_suggestions = face_index.suggest_people_for_all_clusters()
+        cluster_suggestions = {
+            s["cluster_id"]: s for s in face_index.suggest_cluster_groupings()
+            if s["cluster_id"] not in person_suggestions
+        }
+
+        tier1_ids = [cid for cid in by_id if cid in person_suggestions]
+        name_group_size = {}
+        for cid in tier1_ids:
+            name = person_suggestions[cid]["name"]
+            name_group_size[name] = name_group_size.get(name, 0) + 1
+        # Biggest suggested-group first (most pending clusters to clear for one name in
+        # one pass), then within a name group, most-confident suggestion first.
+        tier1_ids.sort(key=lambda cid: (-name_group_size[person_suggestions[cid]["name"]],
+                                         person_suggestions[cid]["name"],
+                                         -person_suggestions[cid]["similarity"]))
+
+        remaining_ids = [cid for cid in by_id if cid not in person_suggestions]  # original (size) order preserved
+        tier2_ordered, visited = [], set()
+        for cid in remaining_ids:
+            if cid in visited or cid not in cluster_suggestions:
+                continue
+            tier2_ordered.append(cid)
+            visited.add(cid)
+            sibling_id = cluster_suggestions[cid]["suggested_cluster_id"]
+            if sibling_id in by_id and sibling_id not in visited and sibling_id not in person_suggestions:
+                tier2_ordered.append(sibling_id)
+                visited.add(sibling_id)
+        tier3_ids = [cid for cid in remaining_ids if cid not in visited]
+
+        # Suffix stays short - list width is at a premium with hundreds of pending
+        # clusters on screen at once; the similarity score reappears in the status
+        # label once a cluster is actually selected, so it isn't needed twice.
+        ordered = []
+        for cid in tier1_ids:
+            s = person_suggestions[cid]
+            ordered.append((by_id[cid], f" → {s['name']}?"))
+        for cid in tier2_ordered:
+            s = cluster_suggestions[cid]
+            ordered.append((by_id[cid], f" ≈ C{s['suggested_cluster_id']}"))
+        for cid in tier3_ids:
+            ordered.append((by_id[cid], ""))
+        for c in unclustered:
+            ordered.append((c, ""))
+        return ordered
+
+    def _on_people_group_selected(self, item):
+        import face_index
+        data = item.data(Qt.ItemDataRole.UserRole)
+        self.people_current_group = data
+        self.people_excluded_faces = set()
+        self.people_current_matches_plan = []
+        self.people_accepted_matches = set()
+        self.people_name_box.clear()
+
+        is_cluster = data["type"] == "cluster"
+        is_person = data["type"] == "person"
+        # Hidden, not just disabled - Confirm/Discard belong to reviewing a pending
+        # cluster, Rename/Remove belong to browsing an already-labeled person; only
+        # one pair is ever relevant to what's currently selected (2026-08-24 request).
+        self.btn_confirm_label.setVisible(is_cluster)
+        self.btn_discard_cluster.setVisible(is_cluster)
+        self.btn_rename_person.setVisible(is_person)
+        self.btn_remove_from_person.setVisible(is_person)
+        self.btn_apply_matches.setVisible(False)
+        if is_cluster:
+            faces = face_index.get_faces_for_cluster(data["cluster_id"])
+        else:
+            faces = face_index.get_faces_for_person(data["person_id"])
+        # Cluster faces start all-checked (opt-out exclude, most faces genuinely belong).
+        # A labeled person's faces start all-UNCHECKED instead (2026-08-24 request) -
+        # nothing's presumed wrong, so nothing starts marked; checking one is how you flag
+        # it for Remove from Person. people_excluded_faces means "unchecked" either way, so
+        # starting a person's set as everything-displayed achieves "all unchecked" using the
+        # exact same toggle/act-on-what's-not-excluded logic Confirm already uses.
+        self._show_people_faces(faces, default_selected=is_cluster)
+        if is_person:
+            self.people_excluded_faces = {f["face_vector_index"] for f in self.people_displayed_faces}
+
+        if is_person:
+            # Pre-fill with the current name so it's a quick edit, not a
+            # retype - Rename (or Enter) sends whatever's in the box.
+            self.people_name_box.setText(data["name"])
+
+        # Pre-fill the name box with a suggested existing person, cluster-vs-labeled-person
+        # (the cluster-level counterpart to Find Matches, which works per-face) - not
+        # meaningful for "Unclustered" (-1), a large mixed bag of many different people,
+        # not one identity to compare as a single centroid. Still just a suggestion - the
+        # name box stays fully editable, and nothing is written unless Confirm is pressed.
+        if is_cluster and data["cluster_id"] != -1:
+            suggestion = face_index.suggest_person_for_cluster(data["cluster_id"])
+            if suggestion:
+                self.people_name_box.setText(suggestion["name"])
+                self.people_status_label.setText(
+                    f"{self.people_status_label.text()} - suggested: {suggestion['name']} "
+                    f"({suggestion['similarity']:.2f} similarity, confirm or type a different name)")
+
+        # Clicking a list item leaves keyboard focus on the list itself, so Enter
+        # would activate the list (not the name box) rather than confirm/rename -
+        # move focus into the box now so Enter works immediately after selecting,
+        # with no extra click needed. selectAll() so a pre-filled suggestion/name
+        # can be either accepted as-is (just press Enter) or typed straight over.
+        self.people_name_box.setFocus()
+        self.people_name_box.selectAll()
+
+    def _find_people_matches(self):
+        """Runs propose_matches() (writes nothing) and shows every suggestion
+        for review - matches start CHECKED (opt-out reject, 2026-08-24
+        request), same default as a cluster's faces: propose_matches() only
+        ever proposes something above DEFAULT_MATCH_THRESHOLD in the first
+        place, so most suggestions genuinely are correct - uncheck the rare
+        wrong one rather than having to check every good one by hand. Apply
+        Selected Matches still only writes what's checked at click time, so
+        this only changes the starting point, not the actual safety net."""
+        import face_index
+        self.people_current_group = {"type": "matches"}
+        self.people_excluded_faces = set()
+        self.people_groups_list.clearSelection()
+        # Only Apply Selected Matches belongs to this mode - hide the cluster/person
+        # buttons rather than just disabling them, same pattern as _on_people_group_selected.
+        self.btn_confirm_label.setVisible(False)
+        self.btn_discard_cluster.setVisible(False)
+        self.btn_rename_person.setVisible(False)
+        self.btn_remove_from_person.setVisible(False)
+        self.btn_apply_matches.setVisible(True)
+
+        self.people_current_matches_plan = face_index.propose_matches()
+        # Pre-accept exactly what's about to be displayed (respecting the same
+        # MAX_FACES_TO_DISPLAY cap _show_match_cards() itself applies) - never the
+        # full plan, so Apply can never act on a match that was never actually shown.
+        self.people_accepted_matches = {
+            m["face_vector_index"] for m in self.people_current_matches_plan[:MAX_FACES_TO_DISPLAY]
+        }
+        self.btn_apply_matches.setEnabled(bool(self.people_current_matches_plan))
+        total = len(self.people_current_matches_plan)
+        if total > MAX_FACES_TO_DISPLAY:
+            self.people_status_label.setText(
+                f"Showing {MAX_FACES_TO_DISPLAY} of {total} suggested matches (all checked) - uncheck any that are "
+                f"wrong, Apply, then Find Matches again for more.")
+        elif total:
+            self.people_status_label.setText(f"{total} suggested match(es), all checked - uncheck any that are wrong, then Apply.")
+        else:
+            self.people_status_label.setText("No suggested matches right now (label a few people first, or nothing new is close enough).")
+        self._show_match_cards(self.people_current_matches_plan)
+
+    def _show_people_faces(self, faces, default_selected=True):
+        import face_index
+        for card in self.people_face_cards:
+            card.setParent(None)
+        self.people_face_cards = []
+        # The exact set Confirm/Discard/Remove are allowed to act on - never the full
+        # underlying group, only what actually got rendered and reviewable. See
+        # face_index.label_faces()/discard_faces() for why this distinction exists.
+        self.people_displayed_faces = faces[:MAX_FACES_TO_DISPLAY]
+        crops_dir = face_index.get_face_crops_dir()
+        for face in self.people_displayed_faces:
+            self.people_face_cards.append(self._build_face_card(face, crops_dir, default_selected))
+        self._relayout_people_grid()
+        if faces:
+            if len(faces) > MAX_FACES_TO_DISPLAY:
+                self.people_status_label.setText(
+                    f"Showing {MAX_FACES_TO_DISPLAY} of {len(faces)} faces - too many to display at once. "
+                    f"Label or discard these, then reopen the group to see more.")
+            else:
+                self.people_status_label.setText(f"Showing {len(faces)} face(s).")
+
+    def _relayout_people_grid(self):
+        columns = columns_for_width(self.people_scroll_area.viewport().width())
+        for i, card in enumerate(self.people_face_cards):
+            self.people_faces_grid.addWidget(card, i // columns, i % columns)
+
+    def _build_face_card(self, face, crops_dir, default_selected=True):
+        card = QWidget()
+        card.setFixedWidth(RESULT_CARD_WIDTH)
+        card.setStyleSheet("background-color: #1c1c1c; border-radius: 8px;")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(8, 8, 8, 8)
+
+        pixmap = QPixmap(str(crops_dir / face["crop_filename"]))
+        thumbnail = ResultThumbnail(pixmap, RESULT_THUMB_WIDTH, RESULT_THUMB_HEIGHT)
+        thumbnail.preview_clicked.connect(lambda f=face: self._preview_people_face(f))
+        # For a pending cluster: checked = "keep this face in the label" (the default -
+        # most faces in a real cluster genuinely belong), unchecking excludes the rare
+        # stray one. For browsing an already-labeled person (default_selected=False,
+        # 2026-08-24 request): the opposite - nothing's wrong by default, so nothing
+        # starts checked; checking a face marks it for Remove from Person instead.
+        # Same underlying people_excluded_faces set either way (see
+        # _on_people_group_selected's is_person branch for how the starting state differs).
+        thumbnail.select_toggled.connect(lambda checked, f=face: self._toggle_people_face_excluded(f, checked))
+        thumbnail.set_selected(default_selected)
+        card_layout.addWidget(thumbnail)
+
+        source = self._source_badge(face["file_path"])
+        info_label = QLabel(f"{source} score {face['det_score']:.2f} · {face['width']}x{face['height']}")
+        info_label.setStyleSheet("color: #777; font-size: 10px;")
+        card_layout.addWidget(info_label)
+
+        return card
+
+    def _source_badge(self, file_path):
+        """Drive-portable paths (config.to_portable_path) start with 'DRIVE::' -
+        anything else is local (Mac Photos library etc.) - both feed the same
+        list_library_media() pool for indexing, this is purely a display hint."""
+        return "💾 Drive" if str(file_path).startswith("DRIVE::") else "💻 Local"
+
+    def _toggle_people_face_excluded(self, face, checked):
+        if checked:
+            self.people_excluded_faces.discard(face["face_vector_index"])
+        else:
+            self.people_excluded_faces.add(face["face_vector_index"])
+
+    def _show_match_cards(self, plan):
+        import face_index
+        for card in self.people_face_cards:
+            card.setParent(None)
+        self.people_face_cards = []
+        crops_dir = face_index.get_face_crops_dir()
+        # Rendering is capped for the same performance reason as _show_people_faces -
+        # apply_matches() itself stays correct either way, since it only ever acts on
+        # whatever's in people_accepted_matches, which can only contain faces that were
+        # actually displayed and ticked.
+        for match in plan[:MAX_FACES_TO_DISPLAY]:
+            self.people_face_cards.append(self._build_match_card(match, crops_dir))
+        self._relayout_people_grid()
+
+    def _build_match_card(self, match, crops_dir):
+        card = QWidget()
+        card.setFixedWidth(RESULT_CARD_WIDTH)
+        card.setStyleSheet("background-color: #1c1c1c; border-radius: 8px;")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(8, 8, 8, 8)
+
+        pixmap = QPixmap(str(crops_dir / match["crop_filename"]))
+        thumbnail = ResultThumbnail(pixmap, RESULT_THUMB_WIDTH, RESULT_THUMB_HEIGHT)
+        thumbnail.preview_clicked.connect(lambda m=match: self._preview_people_face(m))
+        # Starts checked, matching people_accepted_matches being pre-populated in
+        # _find_people_matches() - visual state and the actual accepted set agree.
+        thumbnail.select_toggled.connect(lambda checked, m=match: self._toggle_people_match_accepted(m, checked))
+        thumbnail.set_selected(True)
+        card_layout.addWidget(thumbnail)
+
+        source = self._source_badge(match["file_path"])
+        info_label = QLabel(f"{source} → {match['proposed_person_name']} ({match['similarity']:.2f})")
+        info_label.setStyleSheet("color: #9cf; font-size: 10px;")
+        card_layout.addWidget(info_label)
+
+        return card
+
+    def _toggle_people_match_accepted(self, match, checked):
+        if checked:
+            self.people_accepted_matches.add(match["face_vector_index"])
+        else:
+            self.people_accepted_matches.discard(match["face_vector_index"])
+
+    def _apply_people_matches(self):
+        import face_index
+        if not self.people_current_matches_plan:
+            return
+        self._snapshot_for_undo(self.people_accepted_matches, f"applied {len(self.people_accepted_matches)} match(es)")
+        count = face_index.apply_matches(self.people_current_matches_plan, self.people_accepted_matches)
+        self.people_status_label.setText(f"Applied {count} accepted match(es).")
+        self.people_current_matches_plan = []
+        self.people_accepted_matches = set()
+        self.btn_apply_matches.setEnabled(False)
+        self._load_people_lists()
+
+    def _preview_people_face(self, face):
+        # file_path in the faces table is stored in the same portable "DRIVE::..." form
+        # as everything else in the shared index (see config.to_portable_path) for files
+        # that live on the external drive - most of them, in practice. Has to be resolved
+        # back to a real, currently-mounted path before opening, same as the Search tab's
+        # results already do via media_search - a raw "DRIVE::..." string isn't a real
+        # filesystem path on its own.
+        real_path = resolve_portable_path(face["file_path"], EXTERNAL_DRIVE_LABEL)
+        if real_path is None:
+            self.people_preview_image.setText(f"Drive '{EXTERNAL_DRIVE_LABEL}' not connected")
+            return
+
+        # PIL, not QPixmap directly - a source photo can be HEIC, which QPixmap has no
+        # codec for (the same reason media_search.get_thumbnail()/get_thumbnail_dir()
+        # exist for the Search tab) - converted through QImage instead of relying on a
+        # pre-generated thumbnail, since faces don't have one of their own yet.
+        from PIL import Image
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+        try:
+            img = Image.open(real_path).convert("RGB")
+        except Exception:
+            self.people_preview_image.setText("Preview unavailable")
+            return
+        qimage = QImage(img.tobytes("raw", "RGB"), img.width, img.height, img.width * 3, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimage.copy())
+        self.people_preview_image.setPixmap(pixmap.scaled(
+            self.people_preview_image.size(), Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation))
+
+    def _on_people_name_box_enter(self):
+        """Enter in the name box means different things depending on what's
+        selected - label a pending cluster, or rename the already-labeled
+        person currently being browsed. Mirrors whichever button is actually
+        enabled right now rather than duplicating that logic here."""
+        if self.people_current_group and self.people_current_group.get("type") == "person":
+            self._rename_people_person()
+        else:
+            self._confirm_people_label()
+
+    def _rename_people_person(self):
+        # people.name is UNIQUE, so renaming to a name already used by someone
+        # else merges the two - see face_index.rename_person()'s docstring.
+        import face_index
+        if not self.people_current_group or self.people_current_group["type"] != "person":
+            return
+        new_name = self.people_name_box.text().strip()
+        if not new_name:
+            self.people_status_label.setText("Type a name first.")
+            return
+        old_name = self.people_current_group["name"]
+        person_id = self.people_current_group["person_id"]
+        try:
+            result_id = face_index.rename_person(person_id, new_name)
+        except ValueError as e:
+            self.people_status_label.setText(str(e))
+            return
+        if result_id != person_id:
+            self.people_status_label.setText(f"Merged '{old_name}' into existing person '{new_name}'.")
+        else:
+            self.people_status_label.setText(f"Renamed '{old_name}' to '{new_name}'.")
+        self._load_people_lists()
+
+    def _confirm_people_label(self):
+        # Acts only on self.people_displayed_faces (what's actually on screen right
+        # now), never on the full cluster in the database - a pending group can be
+        # bigger than MAX_FACES_TO_DISPLAY, and this must never label faces nobody
+        # actually looked at. See face_index.label_faces()'s docstring.
+        import face_index
+        if not self.people_current_group or self.people_current_group["type"] != "cluster":
+            return
+        name = self.people_name_box.text().strip()
+        if not name:
+            self.people_status_label.setText("Type a name first.")
+            return
+        to_label = [f["face_vector_index"] for f in self.people_displayed_faces
+                    if f["face_vector_index"] not in self.people_excluded_faces]
+        self._snapshot_for_undo(to_label, f"labeled {len(to_label)} face(s) as {name}")
+        try:
+            person_id, count = face_index.label_faces(to_label, name)
+        except ValueError as e:
+            self.people_status_label.setText(str(e))
+            self.people_last_action = None  # nothing actually written - no undo to offer
+            self.btn_undo.setEnabled(False)
+            return
+        self.people_status_label.setText(f"Labeled {count} face(s) as {name}.")
+        self._load_people_lists()
+
+    def _discard_people_cluster(self):
+        # Same displayed-only scoping as _confirm_people_label - see face_index.discard_faces().
+        import face_index
+        if not self.people_current_group or self.people_current_group["type"] != "cluster":
+            return
+        to_discard = [f["face_vector_index"] for f in self.people_displayed_faces]
+        self._snapshot_for_undo(to_discard, f"discarded {len(to_discard)} face(s)")
+        count = face_index.discard_faces(to_discard)
+        self.people_status_label.setText(f"Discarded {count} face(s) - not a real person or not worth labeling.")
+        self._load_people_lists()
+
+    def _remove_from_person(self):
+        # Opposite selection polarity from a cluster: faces start UNCHECKED here, so
+        # "checked" (not in people_excluded_faces) means "flagged to remove" instead
+        # of "keep" - see _on_people_group_selected's is_person branch.
+        import face_index
+        if not self.people_current_group or self.people_current_group["type"] != "person":
+            return
+        to_remove = [f["face_vector_index"] for f in self.people_displayed_faces
+                     if f["face_vector_index"] not in self.people_excluded_faces]
+        if not to_remove:
+            self.people_status_label.setText("Check at least one face to remove first.")
+            return
+        self._snapshot_for_undo(to_remove, f"removed {len(to_remove)} face(s) from this person")
+        count = face_index.unlabel_faces(to_remove)
+        self.people_status_label.setText(f"Removed {count} face(s) - back in the unlabeled pool.")
+        self._load_people_lists()
+
+    def _snapshot_for_undo(self, face_vector_indices, description):
+        """Captures face state right before a write action so _undo_last_people_
+        action() can reverse exactly that one action - single-level only, this
+        overwrites whatever was snapshotted before, it doesn't stack into a
+        history (2026-08-24 request, deliberately scoped to "undo my last click"
+        rather than a full log)."""
+        import face_index
+        self.people_last_action = {
+            "description": description,
+            "faces": face_index.snapshot_face_states(face_vector_indices),
+        }
+        self.btn_undo.setEnabled(True)
+
+    def _undo_last_people_action(self):
+        import face_index
+        if not self.people_last_action:
+            return
+        face_index.restore_face_states(self.people_last_action["faces"])
+        self.people_status_label.setText(f"Undid: {self.people_last_action['description']}.")
+        self.people_last_action = None
+        self.btn_undo.setEnabled(False)
+        self._load_people_lists()
 
     def add_button(self, layout, text, handler, primary=False):
         """Cuts the repeated create/style/connect/add boilerplate that every

@@ -64,7 +64,7 @@ def resolve_file_types(file_types):
     return resolved or None
 
 
-def search(query, top_k=12, after=None, before=None, file_types=None):
+def search(query, top_k=12, after=None, before=None, file_types=None, person=None):
     """Returns up to top_k results, ranked by cosine similarity, one per
     source file (multiple matching frames from the same video collapse
     into a single result at its best-scoring timestamp).
@@ -81,6 +81,13 @@ def search(query, top_k=12, after=None, before=None, file_types=None):
     added 05-08-2026 since the user is mostly hunting for footage to edit,
     not photos.
 
+    person (optional, an exact face_index people.name string) restricts
+    results to files with at least one face labeled as that person - added
+    2026-08-24, the first real join between this CLIP-based search index and
+    the separate face_index.py identity system. An unknown name (or one with
+    no labeled faces) short-circuits to an empty result before the CLIP
+    model even loads, same as the missing-embeddings-file check below.
+
     Results on the shared external drive are stored path-portably (see
     config.to_portable_path) and resolved back to a real path here, on
     whichever machine happens to be running - a result whose drive isn't
@@ -91,6 +98,17 @@ def search(query, top_k=12, after=None, before=None, file_types=None):
         return []
 
     file_types = resolve_file_types(file_types)
+
+    allowed_paths = None
+    if person:
+        # Local import - keeps face_index's own dependencies (cv2, hdbscan) out of
+        # every plain-text search that doesn't use this filter, same lazy-import
+        # discipline already used for faster_whisper/insightface elsewhere.
+        import face_index
+        allowed_paths = face_index.get_file_paths_for_person(person)
+        if not allowed_paths:
+            return []  # unknown name, or genuinely no labeled faces - nothing to rank
+
     model, _, tokenizer, device = load_clip_model()
     query_vec = embed_text(query, model, tokenizer, device)
 
@@ -113,6 +131,8 @@ def search(query, top_k=12, after=None, before=None, file_types=None):
             continue
         if before and (not date_taken or date_taken > before):
             continue
+        if allowed_paths is not None and stored_path not in allowed_paths:
+            continue
 
         real_path = resolve_portable_path(stored_path, EXTERNAL_DRIVE_LABEL)
         if not real_path or not real_path.exists():
@@ -133,6 +153,107 @@ def search(query, top_k=12, after=None, before=None, file_types=None):
 
     ranked = sorted(best_per_file.values(), key=lambda r: r["score"], reverse=True)
     return ranked[:top_k]
+
+
+def smart_search(query, top_k=12, after=None, before=None, file_types=None, explicit_person=None):
+    """search(), but with any labeled people's names typed directly into the
+    query text detected and pulled out first - "huy and cats" means "photos
+    of Huy, ranked by how well they match 'cats'", not a literal CLIP search
+    for the string "huy and cats" (2026-08-24 request - see
+    face_index.extract_mentioned_people() for the detection rules and their
+    real-data-driven caveats, e.g. why "an"/"Dad" behave differently).
+
+    explicit_person (the Search tab's Person dropdown) is merged in with
+    whatever's detected in the text - lets a name that doesn't parse
+    reliably from free text (excluded ones - see
+    face_index._QUERY_AMBIGUOUS_NAMES) still combine with a typed query.
+
+    - Nobody mentioned (dropdown on "All people", no name detected) ->
+      behaves exactly like search().
+    - One person mentioned -> the same hard filter search(person=...)
+      already does: only their files, ranked by whatever text is left.
+    - Multiple people mentioned -> a file needs only ONE of them, not all
+      (photos of everyone together are a much narrower, rarer category than
+      any one of them alone) - but files matching MORE of the mentioned
+      people are ranked ahead of files matching fewer, CLIP relevance to
+      the leftover text as the tiebreaker within each tier. Every result
+      carries "matched_people" (who) and "match_count" (how many).
+    - If nothing but names is left after extraction (e.g. query was just
+      "huy"), there's nothing left to rank by - the CLIP model isn't even
+      loaded; results are that person's/those people's files, newest first,
+      with "score": None (callers displaying a relevance bar should treat
+      that as "not applicable", not zero)."""
+    import face_index
+    remainder, detected = face_index.extract_mentioned_people(query)
+    mentioned = list(dict.fromkeys(detected + ([explicit_person] if explicit_person else [])))
+
+    if not mentioned:
+        return search(query, top_k=top_k, after=after, before=before, file_types=file_types)
+
+    paths_by_person = {name: face_index.get_file_paths_for_person(name) for name in mentioned}
+    relevant_paths = set().union(*paths_by_person.values())
+    if not relevant_paths:
+        return []
+
+    def _match_count(portable_path):
+        return sum(1 for paths in paths_by_person.values() if portable_path in paths)
+
+    if not remainder.strip():
+        file_types_resolved = resolve_file_types(file_types)
+        conn = init_db()
+        placeholders = ",".join("?" * len(relevant_paths))
+        rows = conn.execute(
+            f"SELECT items.file_path, items.media_type, items.timestamp_seconds, "
+            f"indexed_files.date_taken, indexed_files.lat, indexed_files.lon "
+            f"FROM items JOIN indexed_files ON items.file_path = indexed_files.file_path "
+            f"WHERE items.file_path IN ({placeholders})",
+            list(relevant_paths),
+        ).fetchall()
+        conn.close()
+
+        results = []
+        for stored_path, media_type, timestamp_seconds, date_taken, lat, lon in rows:
+            if file_types_resolved and Path(stored_path).suffix.lower() not in file_types_resolved:
+                continue
+            if after and (not date_taken or date_taken < after):
+                continue
+            if before and (not date_taken or date_taken > before):
+                continue
+            real_path = resolve_portable_path(stored_path, EXTERNAL_DRIVE_LABEL)
+            if not real_path or not real_path.exists():
+                continue
+            results.append({
+                "file_path": str(real_path), "media_type": media_type,
+                "timestamp_seconds": timestamp_seconds, "date_taken": date_taken,
+                "lat": lat, "lon": lon, "score": None,
+                "matched_people": mentioned, "match_count": _match_count(stored_path),
+            })
+        results.sort(key=lambda r: (r["match_count"], r["date_taken"] or ""), reverse=True)
+        return results[:top_k]
+
+    # There's real text to rank by - reuse search()'s full pipeline (type/date
+    # filtering, portable-path resolution, existence checks) with an
+    # effectively unbounded top_k (cheap: it only changes the final slice
+    # size, CLIP scores the whole library either way), then restrict to the
+    # union of mentioned people's files and re-rank by (match_count, score).
+    candidates = search(remainder, top_k=100000, after=after, before=before, file_types=file_types)
+
+    real_to_portable = {}
+    for portable in relevant_paths:
+        real = resolve_portable_path(portable, EXTERNAL_DRIVE_LABEL)
+        if real:
+            real_to_portable[str(real)] = portable
+
+    results = []
+    for r in candidates:
+        portable = real_to_portable.get(r["file_path"])
+        if portable is None:
+            continue
+        r["matched_people"] = mentioned
+        r["match_count"] = _match_count(portable)
+        results.append(r)
+    results.sort(key=lambda r: (r["match_count"], r["score"]), reverse=True)
+    return results[:top_k]
 
 
 def open_files(paths, profile=None):
@@ -164,6 +285,7 @@ GALLERY_STYLE = """
   .info { display:flex; justify-content:space-between; gap:8px; font-size:11px; color:#aaa; margin-top:6px; }
   .info .type { color:#777; text-transform:capitalize; }
   .path { font-size:10px; color:#777; word-break:break-all; margin-top:4px; }
+  .people { font-size:11px; color:#9cf; margin-top:4px; }
   .searchform { display:flex; gap:8px; margin-bottom:20px; flex-wrap:wrap; }
   .searchform input[type=text] { flex:1; min-width:200px; padding:8px; font-size:14px; background:#1c1c1c; border:1px solid #333; color:#eee; border-radius:4px; }
   .searchform input[type=number], .searchform input[type=date], .searchform select { padding:8px; background:#1c1c1c; border:1px solid #333; color:#eee; border-radius:4px; }
@@ -227,7 +349,13 @@ def build_gallery_cards(results, for_server=False):
     absolute quality bands (e.g. "strong match") come later, once a model
     is settled on and there's enough playtesting to calibrate real
     thresholds against."""
-    top_score = results[0]["score"] if results else 1.0
+    # Real scores exist for every result unless smart_search() (2026-08-24) had
+    # nothing left to rank by after pulling a person's name out of the query
+    # (e.g. searching just "huy") - those results carry score=None instead of
+    # a meaningless embed-of-nothing number, so top_score/the relevance bar
+    # both need to tolerate it, not just the individual score below.
+    scored = [r for r in results if r["score"] is not None]
+    top_score = scored[0]["score"] if scored else 1.0
     profile = get_os_profile()
     cards = []
     for r in results:
@@ -246,19 +374,33 @@ def build_gallery_cards(results, for_server=False):
             media_tag = f'<video src="{source_uri}#t={ts}" poster="{thumb_uri}" controls preload="metadata"></video>'
         else:
             media_tag = f'<img src="{thumb_uri}" loading="lazy">'
-        relative_pct = max(0.0, r["score"] / top_score * 100) if top_score else 0.0
-        cards.append(f"""
-        <div class="card">
-            <div class="relevance">
+
+        if r["score"] is None:
+            relevance_html = '<div class="relevance"><span class="raw">no query text to rank by - sorted by date</span></div>'
+        else:
+            relative_pct = max(0.0, r["score"] / top_score * 100) if top_score else 0.0
+            relevance_html = f"""<div class="relevance">
                 <div class="bar"><div class="fill" style="width:{relative_pct:.0f}%"></div></div>
                 <span class="pct">{relative_pct:.0f}%</span>
                 <span class="raw">raw {r['score']:.3f}</span>
-            </div>
+            </div>"""
+
+        # matched_people/match_count only exist on smart_search() results that
+        # detected at least one person - makes the "prioritizing" behavior
+        # visible rather than a silent black box.
+        people_html = ""
+        if r.get("matched_people"):
+            people_html = f'<div class="people">👤 {html.escape(", ".join(r["matched_people"]))} ({r["match_count"]} matched)</div>'
+
+        cards.append(f"""
+        <div class="card">
+            {relevance_html}
             {media_tag}
             <div class="info">
                 <span class="date">{html.escape(r['date_taken']) if r.get('date_taken') else 'no date on file'}</span>
                 <span class="type">{r['media_type']}{f" · GPS {r['lat']:.4f},{r['lon']:.4f}" if r.get('lat') else ""}</span>
             </div>
+            {people_html}
             <div class="path">{html.escape(r['file_path'])}</div>
         </div>""")
     return "".join(cards)
@@ -306,14 +448,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     query_text = " ".join(args.query)
-    results = search(query_text, top_k=args.top, after=args.after, before=args.before, file_types=args.type)
+    results = smart_search(query_text, top_k=args.top, after=args.after, before=args.before, file_types=args.type)
 
     if not results:
         print("No results - has the index been built yet? Run: python3 media_index.py")
     for r in results:
         ts = f" @ {int(r['timestamp_seconds'])}s" if r["timestamp_seconds"] is not None else ""
         date = f"  [{r['date_taken']}]" if r["date_taken"] else ""
-        print(f"{r['score']:.3f}  {r['file_path']}{ts}{date}")
+        score_str = f"{r['score']:.3f}" if r["score"] is not None else "  -  "
+        people = f"  ({', '.join(r['matched_people'])})" if r.get("matched_people") else ""
+        print(f"{score_str}  {r['file_path']}{ts}{date}{people}")
 
     if args.gallery and results:
         render_gallery(query_text, results)

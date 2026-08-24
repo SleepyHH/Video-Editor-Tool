@@ -198,6 +198,41 @@ def init_db(db_path=None):
             timestamp_seconds REAL
         )
     """)
+
+    # Face recognition schema, added 2026-08-19 - a separate, independent pipeline from the
+    # CLIP `items` table above (different model, different embedding dimension, its own
+    # face_embeddings.npy), not layered onto it.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS people (
+            person_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS faces (
+            face_vector_index INTEGER PRIMARY KEY,
+            file_path TEXT NOT NULL,
+            media_type TEXT NOT NULL,
+            timestamp_seconds REAL,
+            timestamp_end_seconds REAL,
+            bbox_x1 INTEGER, bbox_y1 INTEGER, bbox_x2 INTEGER, bbox_y2 INTEGER,
+            det_score REAL NOT NULL,
+            blur REAL NOT NULL,
+            width INTEGER NOT NULL,
+            height INTEGER NOT NULL,
+            passes_filter INTEGER NOT NULL,
+            cluster_id INTEGER,
+            person_id INTEGER,
+            discarded INTEGER NOT NULL DEFAULT 0,
+            crop_filename TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS face_indexed_files (
+            file_path TEXT PRIMARY KEY,
+            mtime REAL NOT NULL
+        )
+    """)
     conn.commit()
     return conn
 
@@ -470,35 +505,15 @@ def build_index(profile=None, progress_callback=None, flush_every=50):
     return total_new
 
 
-def force_reembed_stale_videos():
-    """Un-indexes every video whose stored frame_interval_seconds doesn't
-    match the current FRAME_INTERVAL_SECONDS (including legacy rows from
-    before that column existed, which read as NULL), so the next
-    build_index() call re-embeds them fresh at the current density instead
-    of skipping them as unchanged. Images are untouched - frame interval
-    doesn't apply to them.
+def _delete_and_renumber(conn, stale_paths):
+    """Shared by force_reembed_stale_videos and prune_missing_files: deletes
+    the given file_paths' rows from items/indexed_files, then compacts
+    embeddings.npy and renumbers the surviving items' vector_index to match.
 
-    Also compacts embeddings.npy and renumbers the surviving items'
-    vector_index to match. This isn't just tidiness: vector_index is a
-    direct row-position pointer into the embeddings array (see
-    media_search.search's `scores[vector_index]`), so deleting the stale
-    items rows without renumbering the rest would leave every later
-    lookup pointing at the wrong vector.
-
-    Returns the number of videos queued for re-embedding - call
-    build_index() again afterward to actually do it."""
-    conn = init_db()
-    video_clause = " OR ".join(f"file_path LIKE '%{ext}'" for ext in VIDEO_EXTENSIONS) + \
-        " OR " + " OR ".join(f"file_path LIKE '%{ext.upper()}'" for ext in VIDEO_EXTENSIONS)
-    stale_paths = [row[0] for row in conn.execute(
-        f"SELECT file_path FROM indexed_files WHERE ({video_clause}) "
-        "AND (frame_interval_seconds IS NULL OR frame_interval_seconds != ?)",
-        (FRAME_INTERVAL_SECONDS,),
-    )]
-    if not stale_paths:
-        conn.close()
-        return 0
-
+    This isn't just tidiness: vector_index is a direct row-position pointer
+    into the embeddings array (see media_search.search's `scores[vector_index]`),
+    so deleting rows without renumbering the rest would leave every later
+    lookup pointing at the wrong vector. Caller owns the connection (commit/close)."""
     placeholders = ",".join("?" * len(stale_paths))
     stale_vector_indices = {row[0] for row in conn.execute(
         f"SELECT vector_index FROM items WHERE file_path IN ({placeholders})", stale_paths
@@ -529,6 +544,75 @@ def force_reembed_stale_videos():
             conn.execute("UPDATE items SET vector_index = ? WHERE vector_index = ?", (old_to_new[old_vi], old_vi))
 
     np.save(embeddings_path, embeddings[keep_mask])
+
+
+def force_reembed_stale_videos():
+    """Un-indexes every video whose stored frame_interval_seconds doesn't
+    match the current FRAME_INTERVAL_SECONDS (including legacy rows from
+    before that column existed, which read as NULL), so the next
+    build_index() call re-embeds them fresh at the current density instead
+    of skipping them as unchanged. Images are untouched - frame interval
+    doesn't apply to them.
+
+    Returns the number of videos queued for re-embedding - call
+    build_index() again afterward to actually do it."""
+    conn = init_db()
+    video_clause = " OR ".join(f"file_path LIKE '%{ext}'" for ext in VIDEO_EXTENSIONS) + \
+        " OR " + " OR ".join(f"file_path LIKE '%{ext.upper()}'" for ext in VIDEO_EXTENSIONS)
+    stale_paths = [row[0] for row in conn.execute(
+        f"SELECT file_path FROM indexed_files WHERE ({video_clause}) "
+        "AND (frame_interval_seconds IS NULL OR frame_interval_seconds != ?)",
+        (FRAME_INTERVAL_SECONDS,),
+    )]
+    if not stale_paths:
+        conn.close()
+        return 0
+
+    _delete_and_renumber(conn, stale_paths)
+    conn.commit()
+    conn.close()
+    return len(stale_paths)
+
+
+def prune_missing_files(dry_run=True):
+    """Removes index entries for files that no longer exist on the shared
+    drive - deleted, or moved without the index being told (this project
+    deliberately doesn't do move-detection; a relocated file both loses its
+    old entry here and gets fully re-embedded as new on the next
+    build_index() run - see huys-video-editor-search-tab-built memory for
+    that scoping discussion).
+
+    Only ever considers DRIVE::-portable paths - local-only content (e.g. a
+    Mac's native Photos library, or a PC's local iCloud folder) is EXPECTED
+    to be unresolvable from whichever machine isn't its native one, and
+    pruning those would be wrong, not a cleanup.
+
+    dry_run=True (default): reports the count that WOULD be pruned without
+    touching the database at all. Call again with dry_run=False, once
+    reviewed, to actually delete.
+
+    Refuses to run at all if the drive isn't currently connected - every
+    file would otherwise incorrectly look missing, risking wiping the whole
+    index rather than just the genuinely-stale part of it."""
+    if not find_volume_by_label(EXTERNAL_DRIVE_LABEL):
+        raise RuntimeError(
+            f"'{EXTERNAL_DRIVE_LABEL}' isn't connected - refusing to prune, since every "
+            "file would incorrectly look missing and the whole index could be wiped."
+        )
+
+    conn = init_db()
+    rows = conn.execute("SELECT file_path FROM indexed_files WHERE file_path LIKE 'DRIVE::%'").fetchall()
+    stale_paths = []
+    for (stored_path,) in rows:
+        real_path = resolve_portable_path(stored_path, EXTERNAL_DRIVE_LABEL)
+        if not real_path or not real_path.exists():
+            stale_paths.append(stored_path)
+
+    if dry_run or not stale_paths:
+        conn.close()
+        return len(stale_paths)
+
+    _delete_and_renumber(conn, stale_paths)
     conn.commit()
     conn.close()
     return len(stale_paths)
