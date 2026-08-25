@@ -1,4 +1,4 @@
-"""
+﻿"""
 face_index.py - face-recognition indexing engine: detects faces (insightface's
 buffalo_l - SCRFD detector + ArcFace recognizer), filters out low-quality
 detections, clusters unlabeled faces by identity (HDBSCAN), and persists
@@ -16,6 +16,8 @@ is now the one place that logic lives; face_bakeoff.py imports it back for
 any future model bake-offs rather than keeping its own copy.
 """
 import hashlib
+import os
+import platform
 import re
 from pathlib import Path
 
@@ -30,7 +32,7 @@ pillow_heif.register_heif_opener()
 from config import EXTERNAL_DRIVE_LABEL, VIDEO_EXTENSIONS, get_os_profile, to_portable_path
 from media_index import (
     FRAME_INTERVAL_SECONDS, IMAGE_EXTENSIONS, extract_video_frames,
-    get_index_dir, init_db, list_library_media,
+    get_device, get_index_dir, init_db, list_library_media,
 )
 
 FACE_EMBEDDING_DIM = 512
@@ -144,9 +146,29 @@ def score_face_quality(face):
 
 
 def load_insightface_backend():
+    """ctx_id=-1 is CPU, ctx_id=0 is GPU device 0 - mirrors get_device()'s
+    platform detection (cuda -> GPU; cpu/mps -> CPU, since onnxruntime has
+    no Apple MPS execution provider).
+
+    On Windows, onnxruntime-gpu's CUDA execution provider needs matching
+    cuBLAS/cuDNN DLLs on the process's DLL search path - it doesn't bundle
+    them itself, and there's no guarantee they're installed system-wide
+    (confirmed missing on a real machine: onnxruntime-gpu silently fell back
+    to CPU with zero error, only visible via get_available_providers()).
+    Rather than requiring a separate multi-GB CUDA Toolkit install, this
+    reuses the copies already bundled inside the project's existing torch
+    dependency (same driver/toolkit family CLIP indexing already relies on
+    via media_index.get_device())."""
+    if platform.system() == "Windows" and hasattr(os, "add_dll_directory"):
+        import torch
+        torch_lib = Path(torch.__file__).parent / "lib"
+        if torch_lib.is_dir():
+            os.add_dll_directory(str(torch_lib))
+
     from insightface.app import FaceAnalysis
+    ctx_id = 0 if get_device() == "cuda" else -1
     app = FaceAnalysis(name="buffalo_l")
-    app.prepare(ctx_id=-1, det_size=(640, 640))  # ctx_id=-1 forces CPU explicitly (no CUDA on this Mac)
+    app.prepare(ctx_id=ctx_id, det_size=(640, 640))
     return app
 
 
@@ -1085,7 +1107,7 @@ h1 { font-size: 1.2rem; } h2 { font-size: 1rem; color: #9cf; margin-top: 2rem; }
         )
 
     parts.append("</body></html>")
-    Path(output_path).write_text("".join(parts))
+    Path(output_path).write_text("".join(parts), encoding="utf-8")
 
 
 def suggest_cluster_groupings(min_cluster_size=MIN_CLUSTER_SIZE, similarity_threshold=DEFAULT_MATCH_THRESHOLD, conn=None):
@@ -1179,14 +1201,14 @@ h1 { font-size: 1.2rem; } .stats { color: #aaa; margin-bottom: 1rem; }
     for s in suggestions:
         parts.append(
             f'<div class="row"><img src="{crops_rel}/{s["cluster_crop"]}">'
-            f'<span class="arrow">≈</span>'
+            f'<span class="arrow">â‰ˆ</span>'
             f'<img src="{crops_rel}/{s["suggested_crop"]}">'
             f'<span class="score">{s["similarity"]:.3f}</span>'
             f'<span>cluster {s["cluster_id"]} ({s["cluster_size"]} faces) '
             f'vs. cluster {s["suggested_cluster_id"]} ({s["suggested_cluster_size"]} faces)</span></div>'
         )
     parts.append("</body></html>")
-    Path(output_path).write_text("".join(parts))
+    Path(output_path).write_text("".join(parts), encoding="utf-8")
 
 
 def suggest_duplicate_people(similarity_threshold=DEFAULT_MATCH_THRESHOLD, conn=None):
@@ -1271,13 +1293,13 @@ h1 { font-size: 1.2rem; } .stats { color: #aaa; margin-bottom: 1rem; }
         parts.append(
             f'<div class="row"><img src="{crops_rel}/{s["person_a_crop"]}">'
             f'<span class="name">{s["person_a_name"]}</span>'
-            f'<span class="arrow">≈</span>'
+            f'<span class="arrow">â‰ˆ</span>'
             f'<img src="{crops_rel}/{s["person_b_crop"]}">'
             f'<span class="name">{s["person_b_name"]}</span>'
             f'<span class="score">{s["similarity"]:.3f}</span></div>'
         )
     parts.append("</body></html>")
-    Path(output_path).write_text("".join(parts))
+    Path(output_path).write_text("".join(parts), encoding="utf-8")
 
 
 def build_candidate_suggestions_report(top_k=5, min_similarity=0.3, conn=None):
@@ -1402,7 +1424,7 @@ h1 { font-size: 1.2rem; } .stats { color: #aaa; margin-bottom: 1rem; }
             f'<div class="candidates">{candidate_html}</div></div>'
         )
     parts.append("</body></html>")
-    Path(output_path).write_text("".join(parts))
+    Path(output_path).write_text("".join(parts), encoding="utf-8")
 
 
 def propose_cluster_labels(min_similarity=0.3, min_margin=0.08, top_k=5, conn=None):

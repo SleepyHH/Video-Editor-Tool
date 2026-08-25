@@ -431,7 +431,7 @@ def render_gallery(query, results):
     dropping back to the terminal each time, see media_search_server.py."""
     page = build_gallery_page(query, results)
     gallery_path = Path(tempfile.gettempdir()) / "huys_search_gallery.html"
-    gallery_path.write_text(page)
+    gallery_path.write_text(page, encoding="utf-8")
     webbrowser.open(gallery_path.as_uri())
     return gallery_path
 

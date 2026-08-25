@@ -8,3 +8,7 @@ face_bakeoff_output/
 search_reports/
 *.log
 reorganize_camera_roll_report.txt
+PC memory/
+Mac memory/
+*.pt
+pet_bakeoff/

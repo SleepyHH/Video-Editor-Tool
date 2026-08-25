@@ -230,7 +230,7 @@ def write_report(name, faces, backend_dir, elapsed, image_count, cluster_count, 
         parts.append("</div>")
 
     parts.append("</body></html>")
-    (backend_dir / "report.html").write_text("".join(parts))
+    (backend_dir / "report.html").write_text("".join(parts), encoding="utf-8")
 
 
 def write_diagnostics_report(name, faces, backend_dir):
@@ -252,7 +252,7 @@ def write_diagnostics_report(name, faces, backend_dir):
         parts.extend(_face_tile(face) for face in sorted(faces, key=key))
         parts.append("</div>")
     parts.append("</body></html>")
-    (backend_dir / "diagnostics.html").write_text("".join(parts))
+    (backend_dir / "diagnostics.html").write_text("".join(parts), encoding="utf-8")
 
 
 def main():
